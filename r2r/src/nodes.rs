@@ -1,5 +1,8 @@
 use futures::{
-    channel::{mpsc, oneshot},
+    channel::{
+        mpsc::{self},
+        oneshot,
+    },
     future::{self, join_all, FutureExt, TryFutureExt},
     stream::{Stream, StreamExt},
 };
@@ -60,6 +63,8 @@ pub struct Node {
     timers: Vec<Timer_>,
     // and the publishers, whom we allow to be shared.. hmm.
     pubs: Vec<Arc<Publisher_>>,
+    graph_guard_condition: *const rcl_guard_condition_t,
+    graph_event_senders: Vec<mpsc::Sender<()>>,
     // RosTime clock used by all timers created by create_timer()
     ros_clock: Arc<Mutex<Clock>>,
     // time source that provides simulated time
@@ -211,6 +216,9 @@ impl Node {
                 time_source
             };
 
+            let graph_guard_condition =
+                unsafe { rcl_node_get_graph_guard_condition(node_handle.as_ref()) };
+
             let mut node = Node {
                 params: Arc::new(Mutex::new(IndexMap::new())),
                 context: ctx,
@@ -222,6 +230,8 @@ impl Node {
                 action_servers: Vec::new(),
                 timers: Vec::new(),
                 pubs: Vec::new(),
+                graph_guard_condition,
+                graph_event_senders: Vec::new(),
                 ros_clock,
                 #[cfg(r2r__rosgraph_msgs__msg__Clock)]
                 time_source,
@@ -919,6 +929,43 @@ impl Node {
         Ok(p)
     }
 
+    /// Create a stream of events that fires when the ROS graph changes.
+    pub fn graph_events(&mut self) -> Result<GraphEvents> {
+        if self.graph_guard_condition.is_null() {
+            return Err(Error::RCL_RET_NODE_INVALID);
+        }
+
+        let (tx, rx) = mpsc::channel::<()>(10);
+        self.graph_event_senders.push(tx);
+        Ok(GraphEvents { receiver: rx })
+    }
+
+    fn prune_graph_event_senders(&mut self) {
+        self.graph_event_senders
+            .retain(|sender| !sender.is_closed());
+    }
+
+    fn notify_graph_event_listeners(&mut self) {
+        if self.graph_event_senders.is_empty() {
+            return;
+        }
+
+        let mut still_active = Vec::with_capacity(self.graph_event_senders.len());
+        for mut sender in self.graph_event_senders.drain(..) {
+            let keep = match sender.try_send(()) {
+                Ok(_) => true,
+                // Channel is full but still usable, keep sender.
+                Err(e) if e.is_full() => true,
+                // Channel closed, drop sender.
+                Err(_) => false,
+            };
+            if keep {
+                still_active.push(sender);
+            }
+        }
+        self.graph_event_senders = still_active;
+    }
+
     /// Spin the ROS node.
     ///
     /// This handles wakeups of all subscribes, services, etc on the
@@ -946,6 +993,8 @@ impl Node {
         for p in &self.pubs {
             p.poll_has_inter_process_subscribers();
         }
+
+        self.prune_graph_event_senders();
 
         let timeout = timeout.as_nanos() as i64;
         let mut ws = unsafe { rcl_get_zero_initialized_wait_set() };
@@ -1016,6 +1065,10 @@ impl Node {
             total_action_services += num_services;
         }
 
+        let monitor_graph =
+            !self.graph_event_senders.is_empty() && !self.graph_guard_condition.is_null();
+        let guard_condition_slots = if monitor_graph { 1 } else { 0 };
+
         {
             let mut ctx = self.context.context_handle.lock().unwrap();
 
@@ -1023,7 +1076,7 @@ impl Node {
                 rcl_wait_set_init(
                     &mut ws,
                     self.subscribers.len() + total_action_subs,
-                    0,
+                    guard_condition_slots,
                     self.timers.len() + total_action_timers,
                     self.clients.len() + total_action_clients,
                     self.services.len() + total_action_services,
@@ -1035,6 +1088,16 @@ impl Node {
         }
         unsafe {
             rcl_wait_set_clear(&mut ws);
+        }
+
+        if monitor_graph {
+            unsafe {
+                rcl_wait_set_add_guard_condition(
+                    &mut ws,
+                    self.graph_guard_condition,
+                    std::ptr::null_mut(),
+                );
+            }
         }
 
         for s in &self.subscribers {
@@ -1093,6 +1156,18 @@ impl Node {
                 rcl_wait_set_fini(&mut ws);
             }
             return;
+        }
+
+        if monitor_graph && ws.guard_conditions != std::ptr::null_mut() {
+            let guard_conditions = unsafe {
+                std::slice::from_raw_parts(ws.guard_conditions, guard_condition_slots)
+            };
+            let graph_triggered = guard_conditions
+                .iter()
+                .any(|gc| *gc != std::ptr::null::<rcl_guard_condition_t>());
+            if graph_triggered {
+                self.notify_graph_event_listeners();
+            }
         }
 
         let mut subs_to_remove = vec![];
@@ -1519,6 +1594,28 @@ impl Timer {
         } else {
             Err(Error::RCL_RET_TIMER_INVALID)
         }
+    }
+}
+
+/// Stream of ROS graph change notifications.
+pub struct GraphEvents {
+    receiver: mpsc::Receiver<()>,
+}
+
+impl GraphEvents {
+    /// Wait for the next graph change notification.
+    pub async fn next(&mut self) -> Option<()> {
+        self.receiver.next().await
+    }
+}
+
+impl Stream for GraphEvents {
+    type Item = ();
+
+    fn poll_next(
+        mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        Pin::new(&mut self.receiver).poll_next(cx)
     }
 }
 
