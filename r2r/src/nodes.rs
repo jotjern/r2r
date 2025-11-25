@@ -1293,6 +1293,46 @@ impl Node {
         Ok(res)
     }
 
+    pub fn get_subscribers_info_by_topic(
+        &self, topic_name: &str, no_mangle: bool,
+    ) -> Result<Vec<TopicEndpointInfo>> {
+        let node = self.node_handle.as_ref();
+
+        let topic_c_string =
+            CString::new(topic_name).map_err(|_| Error::RCL_RET_INVALID_ARGUMENT)?;
+
+        let mut allocator = unsafe { rcutils_get_default_allocator() };
+
+        let mut info_array: rcl_topic_endpoint_info_array_t =
+            unsafe { rmw_get_zero_initialized_topic_endpoint_info_array() };
+
+        let result = unsafe {
+            rcl_get_subscriptions_info_by_topic(
+                node,
+                &mut allocator,
+                topic_c_string.as_ptr(),
+                no_mangle,
+                &mut info_array,
+            )
+        };
+
+        if result != RCL_RET_OK as i32 {
+            unsafe { rmw_topic_endpoint_info_array_fini(&mut info_array, &mut allocator) };
+            return Err(Error::from_rcl_error(result));
+        }
+
+        // Convert info_array to Vec<TopicEndpointInfo>
+        let topic_info_list = convert_info_array_to_vec(&info_array);
+
+        let result = unsafe { rmw_topic_endpoint_info_array_fini(&mut info_array, &mut allocator) };
+
+        if result != RCL_RET_OK as i32 {
+            return Err(Error::from_rcl_error(result));
+        }
+
+        Ok(topic_info_list)
+    }
+
     pub fn get_publishers_info_by_topic(
         &self, topic_name: &str, no_mangle: bool,
     ) -> Result<Vec<TopicEndpointInfo>> {
